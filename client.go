@@ -14,9 +14,6 @@ import (
 	"strings"
 )
 
-// GenerateRSAKeyPair, EncodePublicKeyToBase64, and DecryptWithPrivateKey should be implemented in utils.go
-// They should be imported here, assuming you've already implemented them
-
 func main() {
     if len(os.Args) != 3 {
         log.Fatalf("Usage: %s <server> <filename>:<depth>", os.Args[0])
