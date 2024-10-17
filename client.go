@@ -11,7 +11,7 @@ import (
 	"os"
 	"log"
 	"io"
-	//"strings"
+	"strings"
 )
 
 // GenerateRSAKeyPair, EncodePublicKeyToBase64, and DecryptWithPrivateKey should be implemented in utils.go
@@ -61,12 +61,21 @@ func main() {
         fmt.Println("Error reading from server:", err)
         return
     }
-    response := buffer[:n]
+    response := string(buffer[:n])  // Convert buffer to string to check for "Error:"
 
-    // First, split the response into the RSA-encrypted AES key and the AES-encrypted data
+    // Check if the response contains an error message
+    if strings.Contains(response, "Error:") {
+        fmt.Println("Server response:", response) // Print the error message and return
+        return
+    }
+
+    // Convert the response back to bytes after checking for errors
+    responseBytes := buffer[:n]
+
+    // Split the response into the RSA-encrypted AES key and the AES-encrypted data
     rsaKeySize := privateKey.PublicKey.Size() // Get RSA key size (256 bytes for 2048-bit key)
-    encryptedAESKey := response[:rsaKeySize]  // The first part is the RSA-encrypted AES key
-    encryptedFileData := response[rsaKeySize:] // The rest is the AES-encrypted file data
+    encryptedAESKey := responseBytes[:rsaKeySize]  // The first part is the RSA-encrypted AES key
+    encryptedFileData := responseBytes[rsaKeySize:] // The rest is the AES-encrypted file data
 
     // Step 1: Decrypt the AES key using the RSA private key
     aesKey, err := DecryptWithPrivateKey(encryptedAESKey, privateKey)
@@ -84,6 +93,7 @@ func main() {
 
     // Display the decrypted file content
     fmt.Println("Decrypted file content:", string(decryptedFileData))
+
 }
 
 // Decrypt AES-encrypted file data
