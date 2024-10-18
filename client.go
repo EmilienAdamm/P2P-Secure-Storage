@@ -1,115 +1,168 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	//"crypto/rsa"
-	//"crypto/rand"
-	//"crypto/sha256"
-	"fmt"
-	"net"
-	"os"
-	"log"
-	"io"
-	"strings"
+    "bufio"
+    "fmt"
+    "log"
+    "net"
+    "os"
+    "strings"
+    "sync"
 )
 
-func main() {
-    if len(os.Args) != 3 {
-        log.Fatalf("Usage: %s <server> <filename>:<depth>", os.Args[0])
+const clientPort = "1260"
+
+type Client struct {
+    leaderAddr  string
+    mu          sync.Mutex
+    filename    string
+    operation   string
+    requestSent int // Indicates if the request has been sent
+}
+
+func NewClient(filename string) *Client {
+    return &Client{
+        filename:    filename,
+        operation:   "ADD", // Default operation
+        requestSent: 0, // Initialize as not sent
+    }
+}
+
+func (c *Client) Start() error {
+    listener, err := net.Listen("tcp", ":"+clientPort)
+    if err != nil {
+        return fmt.Errorf("failed to start client listener: %v", err)
+    }
+    defer listener.Close()
+
+    fmt.Printf("Client listening on port %s...\n", clientPort)
+    fmt.Printf("Waiting for leader heartbeat...\n")
+
+    for {
+        conn, err := listener.Accept()
+        if err != nil {
+            log.Printf("Error accepting connection: %v", err)
+            continue
+        }
+        go c.handleConnection(conn)
+    }
+}
+
+func (c *Client) handleConnection(conn net.Conn) {
+    if c.requestSent == 1 {
+        conn.Close()
+        return
+    } else {
+        defer conn.Close()
     }
 
-    server := os.Args[1]
-    file := os.Args[2]
-    origin := ":0:" // by default client's is set to 0 to indicate server will be origin
-    file = file + origin
-
-    // Génération de la paire de clés RSA
-    privateKey, publicKey, err := GenerateRSAKeyPair(2048)
+    fmt.Println("Incoming connection")
+    message, err := bufio.NewReader(conn).ReadString('\n')
     if err != nil {
-        log.Fatalf("Erreur lors de la génération des clés: %v", err)
+        log.Printf("Error reading message: %v", err)
+        return
     }
 
-    // Encode la clé publique en Base64
-    publicKeyBase64, err := EncodePublicKeyToBase64(publicKey)
-    if err != nil {
-        log.Fatalf("Erreur lors de l'encodage de la clé publique: %v", err)
-    }
-    file = file + publicKeyBase64
+    message = strings.TrimSpace(message)
+    if strings.HasPrefix(message, "HEARTBEAT") {
+        parts := strings.Split(message, " ")
+        if len(parts) != 2 {
+            log.Printf("Invalid HEARTBEAT message: %s", message)
+            return
+        }
+        leaderPort := parts[1]
 
-    // Connexion au serveur
-    conn, err := net.Dial("tcp", server)
+        c.mu.Lock()
+        //newLeaderAddr := "localhost:" + leaderPort
+        c.leaderAddr = leaderPort
+        // If the request hasn't been sent, send it
+        if c.requestSent == 0 {
+            c.mu.Unlock()
+            fmt.Printf("Received heartbeat from leader: %s\n", c.leaderAddr)
+            go c.sendRequest()
+        } else {
+            c.mu.Unlock()
+            fmt.Printf("Received heartbeat from leader: %s, but request already sent\n", c.leaderAddr)
+        }
+    }
+}
+
+func (c *Client) sendRequest() {
+    c.mu.Lock()
+    leaderAddr := c.leaderAddr
+    c.mu.Unlock()
+
+    if leaderAddr == "" {
+        log.Println("No leader address available")
+        return
+    }
+
+    conn, err := net.Dial("tcp", "localhost:"+leaderAddr)
     if err != nil {
-        fmt.Println("Error:", err)
+        log.Printf("Error connecting to leader: %v", err)
+        c.mu.Lock()
+        c.requestSent = 0 // Reset requestSent to retry later
+        c.mu.Unlock()
         return
     }
     defer conn.Close()
 
-    _, err = conn.Write([]byte(file))
+    request := fmt.Sprintf("%s %s\n", c.operation, c.filename)
+    _, err = fmt.Fprint(conn, request)
     if err != nil {
-        fmt.Println("Error sending filename:", err)
+        log.Printf("Error sending request to leader: %v", err)
+        c.mu.Lock()
+        c.requestSent = 0 // Reset requestSent to retry later
+        c.mu.Unlock()
         return
     }
 
-    // Lecture de la réponse du serveur
-    buffer := make([]byte, 4096) // Increased buffer size to handle large data
-    n, err := conn.Read(buffer)
-    if err != nil && err != io.EOF {
-        fmt.Println("Error reading from server:", err)
-        return
-    }
-    response := string(buffer[:n])  // Convert buffer to string to check for "Error:"
+    fmt.Printf("Sent request to leader: %s", request)
 
-    // Check if the response contains an error message
-    if strings.Contains(response, "Error:") {
-        fmt.Println("Server response:", response) // Print the error message and return
-        return
-    }
-
-    // Convert the response back to bytes after checking for errors
-    responseBytes := buffer[:n]
-
-    // Split the response into the RSA-encrypted AES key and the AES-encrypted data
-    rsaKeySize := privateKey.PublicKey.Size() // Get RSA key size (256 bytes for 2048-bit key)
-    encryptedAESKey := responseBytes[:rsaKeySize]  // The first part is the RSA-encrypted AES key
-    encryptedFileData := responseBytes[rsaKeySize:] // The rest is the AES-encrypted file data
-
-    // Step 1: Decrypt the AES key using the RSA private key
-    aesKey, err := DecryptWithPrivateKey(encryptedAESKey, privateKey)
+    response, err := bufio.NewReader(conn).ReadString('\n')
     if err != nil {
-        fmt.Println("Error decrypting AES key:", err)
+        log.Printf("Error reading response from leader: %v", err)
+        c.mu.Lock()
+        c.requestSent = 1 // Reset requestSent to retry later
+        c.mu.Unlock()
         return
     }
 
-    // Step 2: Decrypt the file data using the decrypted AES key
-    decryptedFileData, err := DecryptWithAESKey(encryptedFileData, aesKey)
-    if err != nil {
-        fmt.Println("Error decrypting file data:", err)
+    fmt.Printf("Received response from leader: %s", response)
+
+    c.handleResponse(response)
+}
+
+func (c *Client) handleResponse(response string) {
+    parts := strings.SplitN(response, " ", 2)
+    if len(parts) != 2 {
+        log.Printf("Invalid response format: %s", response)
         return
     }
 
-    // Display the decrypted file content
-    fmt.Println("Decrypted file content:", string(decryptedFileData))
+    status := parts[0]
+    content := strings.TrimSpace(parts[1])
+    c.requestSent = 2
+    switch status {
+    case "OK":
+        fmt.Printf("Operation %s on file %s successful. Server response: %s\n", c.operation, c.filename, content)
+    case "ERROR":
+        fmt.Printf("Error from server: %s\n", content)
+    default:
+        log.Printf("Unknown response status: %s", status)
+    }
 
 }
 
-// Decrypt AES-encrypted file data
-func DecryptWithAESKey(cipherText []byte, aesKey []byte) ([]byte, error) {
-    block, err := aes.NewCipher(aesKey)
-    if err != nil {
-        return nil, err
+func main() {
+    if len(os.Args) != 2 {
+        log.Fatalf("Usage: %s <filename>", os.Args[0])
     }
 
-    gcm, err := cipher.NewGCM(block)
-    if err != nil {
-        return nil, err
-    }
+    filename := os.Args[1]
+    client := NewClient(filename)
 
-    nonceSize := gcm.NonceSize()
-    if len(cipherText) < nonceSize {
-        return nil, fmt.Errorf("ciphertext too short")
+    if err := client.Start(); err != nil {
+        log.Fatalf("Client failed to start: %v", err)
     }
-
-    nonce, cipherText := cipherText[:nonceSize], cipherText[nonceSize:]
-    return gcm.Open(nil, nonce, cipherText, nil) // Decrypt using AES-GCM
 }

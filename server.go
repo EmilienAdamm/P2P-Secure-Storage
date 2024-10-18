@@ -1,184 +1,354 @@
 package main
 
 import (
-	//"crypto/rand"
-	"crypto/rsa"
-	//"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
+	"bufio"
 	"fmt"
-	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
-	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-func main() {
-	if len(os.Args) != 4 {
-		log.Fatalf("Usage: %s <port> <file_list_file> <server_file>", os.Args[0])
+const (
+	follower  = "FOLLOWER"
+	candidate = "CANDIDATE"
+	leader    = "LEADER"
+)
+
+type Server struct {
+	port              string
+	status            string
+	electionTimeout   time.Duration
+	heartbeatInterval time.Duration
+	mu                sync.Mutex
+	resetTimerCh      chan struct{}
+	otherPorts        []string
+	votesReceived     int
+	totalServers      int
+}
+
+func NewServer(port string, portsFile string) (*Server, error) {
+	otherPorts, err := readPortsFile(portsFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read ports file: %v", err)
 	}
 
-	port := os.Args[1]
-	files := loadLetters(os.Args[2])
-	servers := loadServer(os.Args[3])
+	// Remove own port from otherPorts if present
+	for i, p := range otherPorts {
+		if p == port {
+			otherPorts = append(otherPorts[:i], otherPorts[i+1:]...)
+			break
+		}
+	}
 
-	l, err := net.Listen("tcp", ":"+port)
+	return &Server{
+		port:              port,
+		status:            follower,
+		electionTimeout:   time.Duration(5+rand.Intn(4)) * time.Second,
+		heartbeatInterval: 2 * time.Second,
+		resetTimerCh:      make(chan struct{}),
+		otherPorts:        otherPorts,
+		totalServers:      len(otherPorts) + 1, // including self
+	}, nil
+}
+
+func readPortsFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+	defer file.Close()
+
+	var ports []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		ports = append(ports, scanner.Text())
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return ports, nil
+}
+
+func (s *Server) Start() error {
+	l, err := net.Listen("tcp", ":"+s.port)
+	if err != nil {
+		return fmt.Errorf("failed to listen on port %s: %v", s.port, err)
 	}
 	defer l.Close()
 
-	fmt.Printf("Listening on port %s...\n", port)
+	fmt.Printf("Listening on port %s...\n", s.port)
+	fmt.Printf("Election timeout set to %v\n", s.electionTimeout)
 
-	for { // Deal with incoming connections
+	go s.runElectionTimer()
+
+	for {
 		conn, err := l.Accept()
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Error accepting connection: %v", err)
+			continue
 		}
-		go func(c net.Conn) {
-			fmt.Println("-----------------------")
-			fmt.Println("New connection received")
+		go s.handleConnection(conn)
+	}
+}
 
-			buffer := make([]byte, 1024)
-
-			n, err := c.Read(buffer)
-			if err != nil {
-				if err != io.EOF {
-					log.Println("Error reading from connection:", err)
-				}
-				c.Close()
-				return
+func (s *Server) runElectionTimer() {
+	for {
+		select {
+		case <-time.After(s.electionTimeout):
+			s.mu.Lock()
+			if s.status == follower {
+				s.status = candidate
+				s.votesReceived = 1 // Start with 1 vote (self-vote)
+				fmt.Println("Timeout reached. Server status changed to:", s.status)
+				fmt.Println("Starting with 1 vote (self)")
+				go s.startElection()
 			}
+			s.mu.Unlock()
+		case <-s.resetTimerCh:
+			fmt.Println("Timer reset due to heartbeat")
+		}
+	}
+}
 
-			receivedData := string(buffer[:n])
+func (s *Server) startElection() {
+	fmt.Println("Starting election")
+	for _, port := range s.otherPorts {
+		go s.sendVoteRequest(port)
+	}
+}
 
-			parts := strings.Split(receivedData, ":")
-			if len(parts) != 4 {
-				c.Write([]byte("Invalid input format, expected nomdufichier.extension:depth:origine:pubkey"))
-				return
-			}
+func (s *Server) sendVoteRequest(port string) {
+	conn, err := net.Dial("tcp", "localhost:"+port)
+	if err != nil {
+		log.Printf("Error connecting to %s: %v", port, err)
+		return
+	}
+	defer conn.Close()
 
-			fileName 	:= 	parts[0]
-			depthStr 	:= 	strings.TrimSpace(parts[1])
-			origin		:=	parts[2]
-			publicKey	:=	parts[3]
+	_, err = fmt.Fprintf(conn, "VOTE\n")
+	if err != nil {
+		log.Printf("Error sending VOTE message to %s: %v", port, err)
+		return
+	}
 
-			fmt.Println("FILE NAME IS ", fileName)
-			if origin == "0" {
-				origin = port
-			}
+	response, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		log.Printf("Error reading response from %s: %v", port, err)
+		return
+	}
 
-			if (fileName == "all") {
-				c.Write([]byte("My files are " + files))
-				return
-			}
+	response = strings.TrimSpace(response)
+	fmt.Printf("Received vote response from %s: %s\n", port, response)
 
-			depth, err := strconv.Atoi(depthStr)
-			if err != nil {
-				c.Write([]byte("Invalid depth value"))
-				return
-			}
+	if response == "YES" {
+		s.mu.Lock()
+		s.votesReceived++
+		if s.status == candidate && s.votesReceived > s.totalServers/2 {
+			s.status = leader
+			fmt.Printf("Received majority of votes (%d/%d). Becoming LEADER\n", s.votesReceived, s.totalServers)
+			go s.sendHeartbeats()
+		}
+		s.mu.Unlock()
+	}
+}
 
-			fmt.Println("Depth received", depth)
-			if depth > 0 {
-				if strings.Contains(files, string(fileName[0])) {
-					var err error
-				
-					// Decode the public key from base64
-					publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKey)
-					if err != nil {
-						c.Write([]byte(fmt.Sprintf("Error decoding public key: %v", err)))
-						return
-					}
-				
-					// Convert the decoded bytes into a usable RSA public key
-					publicKeyInterface, err := x509.ParsePKIXPublicKey(publicKeyBytes)
-					if err != nil {
-						c.Write([]byte(fmt.Sprintf("Error parsing public key: %v", err)))
-						return
-					}
-				
-					rsaPublicKey, ok := publicKeyInterface.(*rsa.PublicKey)
-					if !ok {
-						c.Write([]byte("Error: public key is not of type RSA"))
-						return
-					}
-				
-					// Generate fake file data
-					fakeFileData := generateFakeFile(fileName, ""+port)
-				
-					// Encrypt the file data using AES
-					encryptedFileData, aesKey, err := EncryptFileWithAES([]byte(fakeFileData))
-					if err != nil {
-						c.Write([]byte(fmt.Sprintf("Error encrypting file with AES: %v", err)))
-						return
-					}
-				
-					// Encrypt the AES key using RSA
-					encryptedAESKey, err := EncryptAESKeyWithRSA(aesKey, rsaPublicKey)
-					if err != nil {
-						c.Write([]byte(fmt.Sprintf("Error encrypting AES key: %v", err)))
-						return
-					}
-				
-					// Send both the encrypted AES key and encrypted file data
-					c.Write(append(encryptedAESKey, encryptedFileData...))
-				} else {
-					var mainServer, backupServer string
-					if strings.Contains(servers[0][0], string(fileName[0])) { // Determine next and backup server to transmit the request to
-						mainServer, backupServer = servers[0][1], servers[1][1]
-					} else {
-						mainServer, backupServer = servers[1][1], servers[0][1]
-					}
+func (s *Server) sendHeartbeats() {
+	for {
+		s.mu.Lock()
+		if s.status != leader {
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
 
-					if strings.Contains(mainServer, origin) {
-						c.Write([]byte("Error: loop detected, file could not be served."))
-					} else {
-						conn, err := net.Dial("tcp", mainServer)
-						if err != nil { // Connectivity error, connecting to backup server, unless loop
-							if strings.Contains(backupServer, origin) {
-								c.Write([]byte("Error: loop detected, file could not be served."))
-							} else {
-								fmt.Println("Error while connecting to server, using backup server")
-								conn, err = net.Dial("tcp", backupServer)
-								if err != nil {
-									fmt.Println("Error while connecting to back up server")
-									return
-								}
-							}
-						}
-						defer conn.Close()
+		for _, port := range s.otherPorts {
+			go s.sendHeartbeat(port)
+		}
+		go s.sendHeartbeat("1260") // include client in case it exists to inform it of the leader
+		time.Sleep(s.heartbeatInterval)
+	}
+}
 
-						newDepth := depth - 1
-						fileToSend := fmt.Sprintf("%s:%d:%s:%s", fileName, newDepth, port, publicKey)
-						_, err = conn.Write([]byte(fileToSend))
-						if err != nil {
-							fmt.Println("Error sending filename:", err)
-							return
-						}
+func (s *Server) sendHeartbeat(port string) {
+	if port == "1260" {
+		conn, err := net.Dial("tcp", "localhost:"+port)
+		if err != nil {
+			log.Printf("Error connecting to %s: %v", port, err)
+			return
+		}
+		defer conn.Close()
+	
+		heartbeatMsg := fmt.Sprintf("HEARTBEAT %s\n", s.port)
+		_, err = fmt.Fprintf(conn, heartbeatMsg)
+		if err != nil {
+			log.Printf("Error sending HEARTBEAT message to %s: %v", port, err)
+		}
+	} else {
+		conn, err := net.Dial("tcp", "localhost:"+port)
+		if err != nil {
+			log.Printf("Error connecting to %s: %v", port, err)
+			return
+		}
+		defer conn.Close()
+	
+		_, err = fmt.Fprintf(conn, "HEARTBEAT\n")
+		if err != nil {
+			log.Printf("Error sending HEARTBEAT message to %s: %v", port, err)
+		}
+	}
+}
 
-						returnString := ""
-						buffer := make([]byte, 1024)
-						for {
-							n, err := conn.Read(buffer)
-							if err == io.EOF {
-								break
-							} else if err != nil {
-								fmt.Println("Error reading from server:", err)
-								return
-							}
-							returnString += string(buffer[:n])
-							fmt.Println("File I am transmitting is", returnString)
-						}
-						c.Write([]byte(returnString))
-					}
-				}
-			} else {
-				c.Write([]byte("Depth exceeded"))
-			}
-			c.Close()
-		}(conn)
+func (s *Server) handleConnection(conn net.Conn) {
+    defer conn.Close()
+    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+    reader := bufio.NewReader(conn)
+    message, err := reader.ReadString('\n')
+    if err != nil {
+        log.Printf("Error reading from connection: %v", err)
+        return
+    }
+
+    message = strings.TrimSpace(message)
+    fmt.Printf("Received message: %s\n", message)
+
+    // Split the message into command and arguments
+    fields := strings.Fields(message)
+    if len(fields) == 0 {
+        log.Printf("Empty message received")
+        return
+    }
+    command := fields[0]
+    args := fields[1:] // Slice of arguments
+
+    switch command {
+    case "HEARTBEAT":
+        s.handleHeartbeat()
+    case "VOTE":
+        s.handleVote(conn)
+    case "GET":
+        s.handleGet(args, conn)
+    case "ADD":
+        s.handleAdd(args, conn)
+    case "DEL":
+        s.handleDel(args, conn)
+    default:
+        log.Printf("Unknown command: %s", command)
+    }
+}
+
+
+func (s *Server) handleHeartbeat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status != leader {
+		s.status = follower
+		fmt.Println("Received HEARTBEAT, resetting to FOLLOWER")
+		s.resetTimerCh <- struct{}{}
+	}
+}
+
+func (s *Server) handleVote(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	var response string
+	if s.status == follower {
+		response = "YES"
+		s.resetTimerCh <- struct{}{} // Reset election timer
+	} else {
+		response = "NO"
+	}
+	
+	_, err := fmt.Fprintf(conn, "%s\n", response)
+	if err != nil {
+		log.Printf("Error sending vote response: %v", err)
+	}
+	fmt.Printf("Sent vote response: %s\n", response)
+}
+
+func (s *Server) handleAdd(args []string, conn net.Conn) {
+    if len(args) != 1 {
+        log.Printf("ADD command requires exactly one argument")
+        _, _ = fmt.Fprintf(conn, "ERROR Invalid number of arguments for ADD\n")
+        return
+    }
+    filename := args[0]
+    fmt.Printf("Handling ADD for file: %s\n", filename)
+
+    // Simulate adding the file
+    // Here you would implement the logic to add the file to your system
+    // For demonstration, we'll just send a success response
+
+    _, err := fmt.Fprintf(conn, "OK File %s added successfully\n", filename)
+    if err != nil {
+        log.Printf("Error sending response: %v", err)
+    }
+}
+
+
+func (s *Server) handleGet(args []string, conn net.Conn) {
+    if len(args) != 1 {
+        log.Printf("GET command requires exactly one argument")
+        _, _ = fmt.Fprintf(conn, "ERROR Invalid number of arguments for GET\n")
+        return
+    }
+    filename := args[0]
+    fmt.Printf("Handling GET for file: %s\n", filename)
+
+    // Implement logic to retrieve the file
+    // For demonstration, we'll simulate success
+
+    _, err := fmt.Fprintf(conn, "OK File %s retrieved successfully\n", filename)
+    if err != nil {
+        log.Printf("Error sending response: %v", err)
+    }
+}
+
+func (s *Server) handleDel(args []string, conn net.Conn) {
+    if len(args) != 1 {
+        log.Printf("DEL command requires exactly one argument")
+        _, _ = fmt.Fprintf(conn, "ERROR Invalid number of arguments for DEL\n")
+        return
+    }
+    filename := args[0]
+    fmt.Printf("Handling DEL for file: %s\n", filename)
+
+    // Implement logic to delete the file
+    // For demonstration, we'll simulate success
+
+    _, err := fmt.Fprintf(conn, "OK File %s deleted successfully\n", filename)
+    if err != nil {
+        log.Printf("Error sending response: %v", err)
+    }
+}
+
+func (s *Server) handleGet()     { fmt.Println("Handling GET") }
+func (s *Server) handleAdd()     { fmt.Println("Handling ADD") }
+func (s *Server) handleDel()     { fmt.Println("Handling DEL") }
+
+func main() {
+	if len(os.Args) != 3 {
+		log.Fatalf("Usage: %s <port> <ports_file>", os.Args[0])
+	}
+
+	port := os.Args[1]
+	portsFile := os.Args[2]
+
+	rand.Seed(time.Now().UnixNano())
+
+	server, err := NewServer(port, portsFile)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	if err := server.Start(); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
 	}
 }
